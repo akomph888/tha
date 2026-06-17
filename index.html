@@ -263,9 +263,13 @@
                     <span class="text-slate-400">จำนวนครั้งที่ป้ายหลุดมือกลางคัน (Motor drops):</span>
                     <span id="modal-mot-drops" class="font-bold text-fuchsia-400 font-mono">0 ครั้ง</span>
                 </div>
-                <div class="flex justify-between">
+                <div class="flex justify-between border-b border-slate-900 pb-1.5">
                     <span class="text-slate-400">สัดส่วนความแม่นยำรวมของพฤติกรรม (Accuracy rate):</span>
                     <span id="modal-accuracy" class="font-bold text-emerald-400 font-mono">0%</span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-slate-400">รวมเวลาที่ใช้ในการทดสอบทั้งหมด (Total Duration):</span>
+                    <span id="modal-time" class="font-bold text-cyan-400 font-mono">0s</span>
                 </div>
             </div>
 
@@ -348,6 +352,128 @@
             };
         }
         const sfx = new SoundEffects();
+
+        // --- 1.5 สถานะระบบวิจัยระดับโลก (Global State & DOM Initialization) ---
+        // อ้างอิงอิลิเมนต์ DOM หลักที่ระบบต้องใช้ตลอดการทำงาน
+        const canvasElement = document.getElementById('game-canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const videoElement = document.getElementById('webcam');
+        const paletteContainer = document.getElementById('bone-palette');
+        const placedCounterEl = document.getElementById('placed-counter');
+
+        // สถานะกิจกรรมการวิจัย: CALIBRATION | ACTIVE_RESEARCH | COMPLETE
+        let currentActivityState = "CALIBRATION";
+        let activeCaseIndex = 0;
+        let inputMode = "AR"; // AR | MOUSE
+        let baselineMotorSpeed = 0.0;
+
+        // สถานะการคีบ/ลากอุปกรณ์ใน Canvas
+        let boneItems = [];
+        let calibrationBlock = {
+            currentX: 0,
+            currentY: 0,
+            width: 150,
+            height: 44,
+            isPlaced: false,
+            isHovered: false
+        };
+        let activeDraggedId = null;
+        let grabOffsetX = 0;
+        let grabOffsetY = 0;
+        let isPinching = false;
+
+        // ตำแหน่งเคอร์เซอร์ในพิกัด Canvas
+        let cursorX = 0;
+        let cursorY = 0;
+
+        // สถานะการตรวจจับมือผ่าน MediaPipe
+        let handsAI = null;
+        let isHandDetected = false;
+        let handLandmarks = null;
+
+        // สถานะจับเวลาสำหรับงานวิจัย
+        let startTime = Date.now();
+        let calibrationStartTime = 0;
+        let caseLoadTime = Date.now();
+        let correctBoneFirstGrabTime = 0;
+
+        // สถิติการประเมินเชิงพฤติกรรมแยก Cognitive vs Motor
+        let totalAttempts = 0;
+        let successfulMatches = 0;
+        let totalErrors = 0;
+        let totalCognitiveErrors = 0;
+        let totalMotorDrops = 0;
+        let currentDecisionTime = 0.0;
+        let currentExecutionTime = 0.0;
+
+        // คลังข้อมูล log วิจัยที่จะส่งออกเป็น CSV
+        let researchLogs = [];
+
+        // ตัวจับเวลา toast แจ้งเตือน (กัน toast ทับซ้อนกัน)
+        let _toastTimer = null;
+
+        // --- ฟังก์ชันแจ้งเตือนแบบ Toast (แทนการใช้ alert ของเบราว์เซอร์) ---
+        function showNotification(message, type = "info") {
+            const toast = document.getElementById('custom-toast');
+            const toastText = document.getElementById('toast-text');
+            const toastIcon = document.getElementById('toast-icon');
+            if (!toast || !toastText || !toastIcon) return;
+
+            toastText.innerText = message;
+            const iconMap = { success: '✅', error: '❌', warning: '⚠️', info: 'ℹ️' };
+            toastIcon.innerText = iconMap[type] || iconMap.info;
+
+            const colorMap = {
+                success: 'border-emerald-500/50',
+                error: 'border-rose-500/50',
+                warning: 'border-amber-500/50',
+                info: 'border-teal-500/40'
+            };
+            toast.className = `fixed bottom-6 right-6 z-50 bg-slate-900 border ${
+                colorMap[type] || colorMap.info
+            } px-4 py-3 rounded-xl shadow-2xl text-xs flex items-center gap-2.5 max-w-sm`;
+            toast.classList.remove('hidden');
+
+            if (_toastTimer) clearTimeout(_toastTimer);
+            _toastTimer = setTimeout(() => {
+                toast.classList.add('hidden');
+            }, 3500);
+        }
+
+        // --- ฟังก์ชันโหลดกรณีศึกษาพยาบาล THA และจัดการสิ้นสุดงานวิจัย ---
+        function loadCase(idx) {
+            // หากทำครบทุกเคส ให้สรุปรายงานวิจัย
+            if (idx >= CLINICAL_CASES.length) {
+                currentActivityState = "COMPLETE";
+                triggerResearchEnd();
+                return;
+            }
+
+            activeCaseIndex = idx;
+            caseLoadTime = Date.now();
+            correctBoneFirstGrabTime = 0;
+
+            // รีเซ็ตตำแหน่งอุปกรณ์ทุกชิ้นกลับคลังสำหรับเคสใหม่
+            if (boneItems && boneItems.length > 0) {
+                boneItems.forEach(item => {
+                    item.isPlaced = false;
+                    item.isHovered = false;
+                    resetCardPosition(item);
+                });
+            }
+
+            const caseData = CLINICAL_CASES[idx];
+            const caseIndexEl = document.getElementById('case-index');
+            const caseTitleEl = document.getElementById('case-title');
+            const caseScenarioEl = document.getElementById('case-scenario');
+            if (caseIndexEl) caseIndexEl.innerText = `Case ${idx + 1} / ${CLINICAL_CASES.length}`;
+            if (caseTitleEl) caseTitleEl.innerText = caseData.title;
+            if (caseScenarioEl) caseScenarioEl.innerText = caseData.scenario;
+
+            // รีเฟรชแผงขวาและสถิติ
+            updateSidebarPalette();
+            updateStatsDisplay();
+        }
 
         // --- 2. ข้อมูลการพยาบาลผ่าตัดสะโพกเทียม (Total Hip Arthroplasty - THA Care Map) ---
         const BONE_DATA = [
@@ -1056,8 +1182,10 @@
             document.getElementById('modal-mot-drops').innerText = `${totalMotorDrops} ครั้ง`;
             
             const accuracy = totalAttempts > 0 ? Math.round((successfulMatches / totalAttempts) * 100) : 0;
-            document.getElementById('modal-accuracy').innerText = `${accuracy}%`;
-            document.getElementById('modal-time').innerText = `${duration}s`;
+            const modalAccuracyEl = document.getElementById('modal-accuracy');
+            if (modalAccuracyEl) modalAccuracyEl.innerText = `${accuracy}%`;
+            const modalTimeEl = document.getElementById('modal-time');
+            if (modalTimeEl) modalTimeEl.innerText = `${duration}s`;
 
             let feedText = "";
             if (totalCognitiveErrors === 0 && parseFloat(meanDecision) < 5.0) {
